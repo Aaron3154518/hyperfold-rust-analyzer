@@ -10,7 +10,7 @@ use crossbeam_channel::{select, Receiver};
 use flycheck::FlycheckHandle;
 use ide_db::base_db::{SourceDatabaseExt, VfsPath};
 use lsp_server::{Connection, Notification, Request};
-use lsp_types::notification::Notification as _;
+use lsp_types::{notification::Notification as _, Diagnostic, DiagnosticSeverity, Position, Range};
 use stdx::thread::ThreadIntent;
 use triomphe::Arc;
 use vfs::FileId;
@@ -329,7 +329,32 @@ impl GlobalState {
             }
         }
 
-        if let Some(diagnostic_changes) = self.diagnostics.take_changes() {
+        if let Some(mut diagnostic_changes) = self.diagnostics.take_changes() {
+            if let Some(id) = self.vfs.read().0.file_id(&VfsPath::new_real_path(
+                "C:\\Users\\aaore\\repos\\hyperfold-game\\test\\src\\main.rs".to_string(),
+            )) {
+                diagnostic_changes.insert(id);
+                self.diagnostics.add_check_diagnostic(
+                    self.flycheck[0].id(),
+                    id,
+                    Diagnostic {
+                        range: Range {
+                            start: Position { line: 0, character: 0 },
+                            end: Position { line: 0, character: 10 },
+                        },
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        code: None,
+                        code_description: None,
+                        source: None,
+                        message: "You fucked up".to_string(),
+                        related_information: None,
+                        tags: None,
+                        data: None,
+                    },
+                    None,
+                );
+            }
+
             for file_id in diagnostic_changes {
                 let uri = file_id_to_url(&self.vfs.read().0, file_id);
                 let mut diagnostics =
