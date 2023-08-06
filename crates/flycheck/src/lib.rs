@@ -5,7 +5,9 @@
 #![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
 
 use std::{
-    fmt, io,
+    env, fmt, fs,
+    io::{self, Read},
+    path::PathBuf,
     process::{ChildStderr, ChildStdout, Command, Stdio},
     time::Duration,
 };
@@ -13,6 +15,7 @@ use std::{
 use command_group::{CommandGroup, GroupChild};
 use crossbeam_channel::{never, select, unbounded, Receiver, Sender};
 use paths::AbsPathBuf;
+use rand::{distributions::Alphanumeric, Rng};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use stdx::process::streaming_output;
@@ -169,6 +172,7 @@ struct FlycheckActor {
     /// have to wrap sub-processes output handling in a thread and pass messages
     /// back over a channel.
     cargo_handle: Option<CargoHandle>,
+    build_receiver: Option<Receiver<CargoMessage>>,
 }
 
 enum Event {
@@ -184,7 +188,14 @@ impl FlycheckActor {
         workspace_root: AbsPathBuf,
     ) -> FlycheckActor {
         tracing::info!(%id, ?workspace_root, "Spawning flycheck");
-        FlycheckActor { id, sender, config, root: workspace_root, cargo_handle: None }
+        FlycheckActor {
+            id,
+            sender,
+            config,
+            root: workspace_root,
+            cargo_handle: None,
+            build_receiver: None,
+        }
     }
 
     fn report_progress(&self, progress: Progress) {
@@ -200,6 +211,7 @@ impl FlycheckActor {
         select! {
             recv(inbox) -> msg => msg.ok().map(Event::RequestStateChange),
             recv(check_chan.unwrap_or(&never())) -> msg => Some(Event::CheckEvent(msg.ok())),
+            recv(self.build_receiver.as_ref().unwrap_or(&never())) -> msg => Some(Event::CheckEvent(msg.ok())),
         }
     }
 
@@ -222,7 +234,9 @@ impl FlycheckActor {
 
                     let command = self.check_command();
                     tracing::debug!(?command, "will restart flycheck");
-                    match CargoHandle::spawn(command) {
+                    let (sender, receiver) = unbounded();
+                    self.build_receiver = Some(receiver);
+                    match CargoHandle::spawn(command, sender) {
                         Ok(cargo_handle) => {
                             tracing::debug!(
                                 command = ?self.check_command(),
@@ -252,6 +266,7 @@ impl FlycheckActor {
                             self.check_command()
                         );
                     }
+
                     self.report_progress(Progress::DidFinish(res));
                 }
                 Event::CheckEvent(Some(message)) => match message {
@@ -397,13 +412,33 @@ struct CargoHandle {
     child: JodGroupChild,
     thread: stdx::thread::JoinHandle<io::Result<(bool, String)>>,
     receiver: Receiver<CargoMessage>,
+    build_sender: Sender<CargoMessage>,
+    file: PathBuf,
 }
 
 impl CargoHandle {
-    fn spawn(mut command: Command) -> std::io::Result<CargoHandle> {
+    fn spawn(
+        mut command: Command,
+        build_sender: Sender<CargoMessage>,
+    ) -> std::io::Result<CargoHandle> {
+        eprintln!("Spawn");
+        let name: String =
+            rand::thread_rng().sample_iter(&Alphanumeric).take(7).map(char::from).collect();
+        let name = "Hey";
+        let file = env::temp_dir().join(name);
+        // let listener = LocalSocketListener::bind(name).unwrap();
+        // eprintln!("Listening on: {name}");
+        std::env::set_var("RUST_ANALYZER_FILE", name);
+
         command.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
         let mut child = command.group_spawn().map(JodGroupChild)?;
 
+        // eprintln!("Connecting...");
+        // let reader = match listener.accept() {
+        //     Ok(c) => io::BufReader::new(c),
+        //     Err(e) => panic!("Incoming connection failed: {e}"),
+        // };
+        // eprintln!("Connected");
         let stdout = child.0.inner().stdout.take().unwrap();
         let stderr = child.0.inner().stderr.take().unwrap();
 
@@ -413,7 +448,7 @@ impl CargoHandle {
             .name("CargoHandle".to_owned())
             .spawn(move || actor.run())
             .expect("failed to spawn thread");
-        Ok(CargoHandle { child, thread, receiver })
+        Ok(CargoHandle { child, thread, receiver, build_sender, file })
     }
 
     fn cancel(mut self) {
@@ -422,9 +457,35 @@ impl CargoHandle {
     }
 
     fn join(mut self) -> io::Result<()> {
+        eprintln!("Kill");
         let _ = self.child.0.kill();
+        eprintln!("Wait");
         let exit_status = self.child.0.wait()?;
+        eprintln!("Join");
         let (read_at_least_one_message, error) = self.thread.join()?;
+
+        let mut errs = String::new();
+        eprintln!("Checking file");
+        if let Ok(mut f) = fs::File::open(self.file) {
+            eprintln!("Output");
+            let mut out = String::new();
+            f.read_to_string(&mut out).unwrap();
+            for line in out.lines() {
+                eprintln!("{}", process_line(line, &mut errs, &self.build_sender));
+            }
+        } else {
+            eprintln!("No output");
+        }
+
+        // let mut out = String::new();
+        // let mut errs = String::new();
+        // eprintln!("Reading");
+        // while self.reader.read_line(&mut out).is_ok() {
+        //     process_line(&out, &mut errs, &self.sender);
+        //     eprintln!("Read: {out}");
+        //     out.clear();
+        // }
+
         if read_at_least_one_message || exit_status.success() {
             Ok(())
         } else {
@@ -433,6 +494,34 @@ impl CargoHandle {
             )))
         }
     }
+}
+
+fn process_line(line: &str, error: &mut String, sender: &Sender<CargoMessage>) -> bool {
+    // Try to deserialize a message from Cargo or Rustc.
+    let mut deserializer = serde_json::Deserializer::from_str(line);
+    deserializer.disable_recursion_limit();
+    if let Ok(message) = JsonMessage::deserialize(&mut deserializer) {
+        match message {
+            // Skip certain kinds of messages to only spend time on what's useful
+            JsonMessage::Cargo(message) => match message {
+                cargo_metadata::Message::CompilerArtifact(artifact) if !artifact.fresh => {
+                    sender.send(CargoMessage::CompilerArtifact(artifact)).unwrap();
+                }
+                cargo_metadata::Message::CompilerMessage(msg) => {
+                    sender.send(CargoMessage::Diagnostic(msg.message)).unwrap();
+                }
+                _ => (),
+            },
+            JsonMessage::Rustc(message) => {
+                sender.send(CargoMessage::Diagnostic(message)).unwrap();
+            }
+        }
+        return true;
+    }
+
+    error.push_str(line);
+    error.push('\n');
+    false
 }
 
 struct CargoActor {
@@ -460,43 +549,17 @@ impl CargoActor {
         let mut stderr_errors = String::new();
         let mut read_at_least_one_stdout_message = false;
         let mut read_at_least_one_stderr_message = false;
-        let process_line = |line: &str, error: &mut String| {
-            // Try to deserialize a message from Cargo or Rustc.
-            let mut deserializer = serde_json::Deserializer::from_str(line);
-            deserializer.disable_recursion_limit();
-            if let Ok(message) = JsonMessage::deserialize(&mut deserializer) {
-                match message {
-                    // Skip certain kinds of messages to only spend time on what's useful
-                    JsonMessage::Cargo(message) => match message {
-                        cargo_metadata::Message::CompilerArtifact(artifact) if !artifact.fresh => {
-                            self.sender.send(CargoMessage::CompilerArtifact(artifact)).unwrap();
-                        }
-                        cargo_metadata::Message::CompilerMessage(msg) => {
-                            self.sender.send(CargoMessage::Diagnostic(msg.message)).unwrap();
-                        }
-                        _ => (),
-                    },
-                    JsonMessage::Rustc(message) => {
-                        self.sender.send(CargoMessage::Diagnostic(message)).unwrap();
-                    }
-                }
-                return true;
-            }
 
-            error.push_str(line);
-            error.push('\n');
-            false
-        };
         let output = streaming_output(
             self.stdout,
             self.stderr,
             &mut |line| {
-                if process_line(line, &mut stdout_errors) {
+                if process_line(line, &mut stdout_errors, &self.sender) {
                     read_at_least_one_stdout_message = true;
                 }
             },
             &mut |line| {
-                if process_line(line, &mut stderr_errors) {
+                if process_line(line, &mut stderr_errors, &self.sender) {
                     read_at_least_one_stderr_message = true;
                 }
             },
