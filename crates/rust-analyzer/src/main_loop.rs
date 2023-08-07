@@ -329,7 +329,7 @@ impl GlobalState {
             }
         }
 
-        if let Some(mut diagnostic_changes) = self.diagnostics.take_changes() {
+        if let Some(diagnostic_changes) = self.diagnostics.take_changes() {
             for file_id in diagnostic_changes {
                 let uri = file_id_to_url(&self.vfs.read().0, file_id);
                 let mut diagnostics =

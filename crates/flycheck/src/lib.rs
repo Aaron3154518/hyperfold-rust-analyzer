@@ -487,7 +487,6 @@ impl CargoActor {
             error.push('\n');
             false
         };
-
         let output = streaming_output(
             self.stdout,
             self.stderr,
@@ -497,9 +496,14 @@ impl CargoActor {
                 }
             },
             &mut |line| {
-                let line = line.strip_prefix("warning: ").unwrap_or(line);
                 if process_line(line, &mut stderr_errors) {
                     read_at_least_one_stderr_message = true;
+                }
+                // Check build warnings
+                if let Some(line) = line.strip_prefix("warning: ") {
+                    if process_line(line, &mut stderr_errors) {
+                        read_at_least_one_stderr_message = true;
+                    }
                 }
             },
         );
