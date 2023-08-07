@@ -5,9 +5,7 @@
 #![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
 
 use std::{
-    env, fmt, fs,
-    io::{self, Read, Write},
-    path::PathBuf,
+    fmt, io,
     process::{ChildStderr, ChildStdout, Command, Stdio},
     time::Duration,
 };
@@ -15,7 +13,6 @@ use std::{
 use command_group::{CommandGroup, GroupChild};
 use crossbeam_channel::{never, select, unbounded, Receiver, Sender};
 use paths::AbsPathBuf;
-use rand::{distributions::Alphanumeric, Rng};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use stdx::process::streaming_output;
@@ -255,7 +252,6 @@ impl FlycheckActor {
                             self.check_command()
                         );
                     }
-
                     self.report_progress(Progress::DidFinish(res));
                 }
                 Event::CheckEvent(Some(message)) => match message {
@@ -429,7 +425,6 @@ impl CargoHandle {
         let _ = self.child.0.kill();
         let exit_status = self.child.0.wait()?;
         let (read_at_least_one_message, error) = self.thread.join()?;
-
         if read_at_least_one_message || exit_status.success() {
             Ok(())
         } else {
@@ -438,34 +433,6 @@ impl CargoHandle {
             )))
         }
     }
-}
-
-fn process_line(line: &str, error: &mut String, sender: &Sender<CargoMessage>) -> bool {
-    // Try to deserialize a message from Cargo or Rustc.
-    let mut deserializer = serde_json::Deserializer::from_str(line);
-    deserializer.disable_recursion_limit();
-    if let Ok(message) = JsonMessage::deserialize(&mut deserializer) {
-        match message {
-            // Skip certain kinds of messages to only spend time on what's useful
-            JsonMessage::Cargo(message) => match message {
-                cargo_metadata::Message::CompilerArtifact(artifact) if !artifact.fresh => {
-                    sender.send(CargoMessage::CompilerArtifact(artifact)).unwrap();
-                }
-                cargo_metadata::Message::CompilerMessage(msg) => {
-                    sender.send(CargoMessage::Diagnostic(msg.message)).unwrap();
-                }
-                _ => (),
-            },
-            JsonMessage::Rustc(message) => {
-                sender.send(CargoMessage::Diagnostic(message)).unwrap();
-            }
-        }
-        return true;
-    }
-
-    error.push_str(line);
-    error.push('\n');
-    false
 }
 
 struct CargoActor {
@@ -493,18 +460,45 @@ impl CargoActor {
         let mut stderr_errors = String::new();
         let mut read_at_least_one_stdout_message = false;
         let mut read_at_least_one_stderr_message = false;
+        let process_line = |line: &str, error: &mut String| {
+            // Try to deserialize a message from Cargo or Rustc.
+            let mut deserializer = serde_json::Deserializer::from_str(line);
+            deserializer.disable_recursion_limit();
+            if let Ok(message) = JsonMessage::deserialize(&mut deserializer) {
+                match message {
+                    // Skip certain kinds of messages to only spend time on what's useful
+                    JsonMessage::Cargo(message) => match message {
+                        cargo_metadata::Message::CompilerArtifact(artifact) if !artifact.fresh => {
+                            self.sender.send(CargoMessage::CompilerArtifact(artifact)).unwrap();
+                        }
+                        cargo_metadata::Message::CompilerMessage(msg) => {
+                            self.sender.send(CargoMessage::Diagnostic(msg.message)).unwrap();
+                        }
+                        _ => (),
+                    },
+                    JsonMessage::Rustc(message) => {
+                        self.sender.send(CargoMessage::Diagnostic(message)).unwrap();
+                    }
+                }
+                return true;
+            }
+
+            error.push_str(line);
+            error.push('\n');
+            false
+        };
 
         let output = streaming_output(
             self.stdout,
             self.stderr,
             &mut |line| {
-                if process_line(line, &mut stdout_errors, &self.sender) {
+                if process_line(line, &mut stdout_errors) {
                     read_at_least_one_stdout_message = true;
                 }
             },
             &mut |line| {
                 let line = line.strip_prefix("warning: ").unwrap_or(line);
-                if process_line(line, &mut stderr_errors, &self.sender) {
+                if process_line(line, &mut stderr_errors) {
                     read_at_least_one_stderr_message = true;
                 }
             },
